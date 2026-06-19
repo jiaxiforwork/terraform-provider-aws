@@ -7,6 +7,7 @@ package sagemaker
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 
@@ -438,6 +439,36 @@ func resourceEndpointConfiguration() *schema.Resource {
 					ForceNew:     true,
 					ValidateFunc: verify.ValidARN,
 				},
+				"metrics_config": {
+					Type:     schema.TypeList,
+					Optional: true,
+					Computed: true,
+					MaxItems: 1,
+					ForceNew: true,
+					Elem: &schema.Resource{
+						Schema: map[string]*schema.Schema{
+							"enable_detailed_observability": {
+								Type:     schema.TypeBool,
+								Optional: true,
+								Computed: true,
+								ForceNew: true,
+							},
+							"enable_enhanced_metrics": {
+								Type:     schema.TypeBool,
+								Optional: true,
+								Computed: true,
+								ForceNew: true,
+							},
+							"metric_publish_frequency_in_seconds": {
+								Type:         schema.TypeInt,
+								Optional:     true,
+								Computed:     true,
+								ForceNew:     true,
+								ValidateFunc: validation.IntInSlice([]int{10, 30, 60, 120, 180, 240, 300}),
+							},
+						},
+					},
+				},
 				"production_variants": {
 					Type:     schema.TypeList,
 					Required: true,
@@ -653,6 +684,36 @@ func resourceEndpointConfiguration() *schema.Resource {
 											Optional:         true,
 											ForceNew:         true,
 											ValidateDiagFunc: enum.Validate[awstypes.ManagedInstanceScalingStatus](),
+										},
+									},
+								},
+							},
+							"instance_pools": {
+								Type:     schema.TypeList,
+								Optional: true,
+								ForceNew: true,
+								Elem: &schema.Resource{
+									Schema: map[string]*schema.Schema{
+										names.AttrInstanceType: {
+											Type:             schema.TypeString,
+											Required:         true,
+											ForceNew:         true,
+											ValidateDiagFunc: enum.Validate[awstypes.ProductionVariantInstanceType](),
+										},
+										"priority": {
+											Type:         schema.TypeInt,
+											Required:     true,
+											ForceNew:     true,
+											ValidateFunc: validation.IntBetween(1, 5),
+										},
+										"model_name_override": {
+											Type:     schema.TypeString,
+											Optional: true,
+											ForceNew: true,
+											ValidateFunc: validation.All(
+												validation.StringLenBetween(1, 63),
+												validation.StringMatch(regexache.MustCompile(`^[a-zA-Z0-9]([\-a-zA-Z0-9]*[a-zA-Z0-9])?$`), ""),
+											),
 										},
 									},
 								},
@@ -938,11 +999,11 @@ func resourceEndpointConfiguration() *schema.Resource {
 			}
 		},
 
-		CustomizeDiff: validateDataCaptureConfigCustomDiff,
+		CustomizeDiff: endpointConfigurationCustomizeDiff,
 	}
 }
 
-func validateDataCaptureConfigCustomDiff(ctx context.Context, d *schema.ResourceDiff, meta any) error {
+func endpointConfigurationCustomizeDiff(ctx context.Context, d *schema.ResourceDiff, meta any) error {
 	var diags diag.Diagnostics
 
 	configRaw := d.GetRawConfig()
@@ -978,6 +1039,25 @@ func validateDataCaptureConfigCustomDiff(ctx context.Context, d *schema.Resource
 	dataCaptures := configRaw.GetAttr("data_capture_config")
 	if dataCaptures.IsKnown() && !dataCaptures.IsNull() {
 		dataCaptureConfigPlanTimeValidate(dataCapturesPath, dataCaptures, &diags)
+	}
+
+	// Validate instance_type and instance_pools mutual exclusivity
+	for _, variantKey := range []string{"production_variants"} {
+		if v, ok := d.GetOk(variantKey); ok {
+			for i, variant := range v.([]any) {
+				data := variant.(map[string]any)
+				hasInstanceType := data[names.AttrInstanceType].(string) != ""
+				hasInstancePools := len(data["instance_pools"].([]any)) > 0
+				if hasInstanceType && hasInstancePools {
+					diags = append(diags, diag.Diagnostic{
+						Severity:      diag.Error,
+						Summary:       "Conflicting attributes",
+						Detail:        fmt.Sprintf("%s.%d: \"instance_type\" and \"instance_pools\" are mutually exclusive", variantKey, i),
+						AttributePath: cty.GetAttrPath(variantKey),
+					})
+				}
+			}
+		}
 	}
 
 	return sdkdiag.DiagnosticsError(diags)
@@ -1066,6 +1146,10 @@ func resourceEndpointConfigurationCreate(ctx context.Context, d *schema.Resource
 		input.KmsKeyId = aws.String(v.(string))
 	}
 
+	if v, ok := d.GetOk("metrics_config"); ok {
+		input.MetricsConfig = expandMetricsConfig(v.([]any))
+	}
+
 	if v, ok := d.GetOk("shadow_production_variants"); ok && len(v.([]any)) > 0 {
 		input.ShadowProductionVariants = expandProductionVariants(v.([]any))
 	}
@@ -1125,6 +1209,10 @@ func resourceEndpointConfigurationRead(ctx context.Context, d *schema.ResourceDa
 
 	if err := d.Set("explainer_config", flattenEndpointConfigExplainerConfig(endpointConfig.ExplainerConfig)); err != nil {
 		return sdkdiag.AppendErrorf(diags, "setting explainer_config for SageMaker AI Endpoint Configuration (%s): %s", d.Id(), err)
+	}
+
+	if err := d.Set("metrics_config", flattenMetricsConfig(endpointConfig.MetricsConfig)); err != nil {
+		return sdkdiag.AppendErrorf(diags, "setting metrics_config for SageMaker AI Endpoint Configuration (%s): %s", d.Id(), err)
 	}
 
 	return diags
@@ -1260,6 +1348,10 @@ func expandProductionVariants(configured []any) []awstypes.ProductionVariant {
 			l.ManagedInstanceScaling = expandManagedInstanceScaling(v)
 		}
 
+		if v, ok := data["instance_pools"].([]any); ok && len(v) > 0 {
+			l.InstancePools = expandInstancePools(v)
+		}
+
 		if v, ok := data["inference_ami_version"].(string); ok && v != "" {
 			l.InferenceAmiVersion = awstypes.ProductionVariantInferenceAmiVersion(v)
 		}
@@ -1334,6 +1426,10 @@ func flattenProductionVariants(list []awstypes.ProductionVariant) []map[string]a
 
 		if i.CapacityReservationConfig != nil {
 			l["capacity_reservation_config"] = flattenCapacityReservationConfig(i.CapacityReservationConfig)
+		}
+
+		if len(i.InstancePools) > 0 {
+			l["instance_pools"] = flattenInstancePools(i.InstancePools)
 		}
 
 		result = append(result, l)
@@ -2237,5 +2333,80 @@ func flattenClarifyInferenceConfig(config *awstypes.ClarifyInferenceConfig) []ma
 		cfg["probability_index"] = aws.ToInt32(config.ProbabilityIndex)
 	}
 
+	return []map[string]any{cfg}
+}
+
+func expandInstancePools(configured []any) []awstypes.InstancePool {
+	if len(configured) == 0 {
+		return nil
+	}
+
+	pools := make([]awstypes.InstancePool, 0, len(configured))
+	for _, lRaw := range configured {
+		if lRaw == nil {
+			continue
+		}
+		data := lRaw.(map[string]any)
+		pool := awstypes.InstancePool{
+			InstanceType: awstypes.ProductionVariantInstanceType(data[names.AttrInstanceType].(string)),
+			Priority:     aws.Int32(int32(data["priority"].(int))),
+		}
+		if v, ok := data["model_name_override"].(string); ok && v != "" {
+			pool.ModelNameOverride = aws.String(v)
+		}
+		pools = append(pools, pool)
+	}
+	return pools
+}
+
+func flattenInstancePools(pools []awstypes.InstancePool) []map[string]any {
+	if len(pools) == 0 {
+		return nil
+	}
+
+	result := make([]map[string]any, 0, len(pools))
+	for _, pool := range pools {
+		m := map[string]any{
+			names.AttrInstanceType: pool.InstanceType,
+			"priority":             aws.ToInt32(pool.Priority),
+		}
+		if pool.ModelNameOverride != nil {
+			m["model_name_override"] = aws.ToString(pool.ModelNameOverride)
+		}
+		result = append(result, m)
+	}
+	return result
+}
+
+func expandMetricsConfig(configured []any) *awstypes.MetricsConfig {
+	if len(configured) == 0 || configured[0] == nil {
+		return nil
+	}
+
+	m := configured[0].(map[string]any)
+	c := &awstypes.MetricsConfig{}
+
+	if v, ok := m["enable_detailed_observability"].(bool); ok {
+		c.EnableDetailedObservability = aws.Bool(v)
+	}
+	if v, ok := m["enable_enhanced_metrics"].(bool); ok {
+		c.EnableEnhancedMetrics = aws.Bool(v)
+	}
+	if v, ok := m["metric_publish_frequency_in_seconds"].(int); ok && v > 0 {
+		c.MetricPublishFrequencyInSeconds = int32(v)
+	}
+	return c
+}
+
+func flattenMetricsConfig(config *awstypes.MetricsConfig) []map[string]any {
+	if config == nil {
+		return []map[string]any{}
+	}
+
+	cfg := map[string]any{
+		"enable_detailed_observability":       aws.ToBool(config.EnableDetailedObservability),
+		"enable_enhanced_metrics":             aws.ToBool(config.EnableEnhancedMetrics),
+		"metric_publish_frequency_in_seconds": int(config.MetricPublishFrequencyInSeconds),
+	}
 	return []map[string]any{cfg}
 }
